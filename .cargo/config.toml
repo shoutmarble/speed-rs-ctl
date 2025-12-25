@@ -1,0 +1,11 @@
+# Ensure `cargo build` defaults to the ESP32-S3 target.
+# Without this, Cargo will try to build for the host (Windows), which breaks esp-* crates.
+
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+# The esp toolchain includes Rust source but not prebuilt core/alloc for xtensa targets.
+# Build them from source as part of the build.
+[unstable]
+build-std = ["core", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
