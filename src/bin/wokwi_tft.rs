@@ -7,8 +7,7 @@
 )]
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
-use speed as _;
+use speed::demo;
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
@@ -23,7 +22,6 @@ use esp_hal::{
 use embedded_graphics::{
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
 };
 use embedded_hal_bus::spi::ExclusiveDevice;
 use log::info;
@@ -84,29 +82,9 @@ async fn main(_spawner: Spawner) -> ! {
         .init(&mut delay)
         .unwrap();
 
-    display.clear(Rgb565::BLACK).unwrap();
-
-    Rectangle::new(Point::new(0, 0), Size::new(240, 80))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
-        .draw(&mut display)
-        .unwrap();
-
-    Rectangle::new(Point::new(0, 80), Size::new(240, 80))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::GREEN))
-        .draw(&mut display)
-        .unwrap();
-
-    Rectangle::new(Point::new(0, 160), Size::new(240, 80))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
-        .draw(&mut display)
-        .unwrap();
+    demo::draw_test_bars(&mut display).unwrap();
 
     info!("Wokwi TFT demo running.");
 
-    loop {
-        display.clear(Rgb565::BLACK).unwrap();
-        Timer::after(Duration::from_millis(500)).await;
-        display.clear(Rgb565::WHITE).unwrap();
-        Timer::after(Duration::from_millis(500)).await;
-    }
+    demo::cycle_hues(&mut display).await
 }

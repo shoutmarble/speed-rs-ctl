@@ -35,3 +35,54 @@ pub mod tft {
 		Rgb565::new(r, g, b)
 	}
 }
+
+pub mod demo {
+	use embassy_time::{Duration, Timer};
+	use embedded_graphics::{
+		pixelcolor::Rgb565,
+		prelude::*,
+		primitives::{PrimitiveStyle, Rectangle},
+	};
+
+	pub fn draw_test_bars<D>(display: &mut D) -> Result<(), D::Error>
+	where
+		D: DrawTarget<Color = Rgb565> + OriginDimensions,
+	{
+		display.clear(Rgb565::BLACK)?;
+
+		let size = display.size();
+		let bar_h = size.height / 3;
+
+		Rectangle::new(Point::new(0, 0), Size::new(size.width, bar_h))
+			.into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
+			.draw(display)?;
+
+		Rectangle::new(Point::new(0, bar_h as i32), Size::new(size.width, bar_h))
+			.into_styled(PrimitiveStyle::with_fill(Rgb565::GREEN))
+			.draw(display)?;
+
+		Rectangle::new(
+			Point::new(0, (bar_h * 2) as i32),
+			Size::new(size.width, size.height - bar_h * 2),
+		)
+		.into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
+		.draw(display)?;
+
+		Ok(())
+	}
+
+	pub async fn cycle_hues<D>(display: &mut D) -> !
+	where
+		D: DrawTarget<Color = Rgb565>,
+	{
+		let mut hue: u8 = 0;
+		loop {
+			let _ = display.clear(super::tft::color_wheel(hue));
+			Timer::after(Duration::from_millis(150)).await;
+			let _ = display.clear(Rgb565::BLACK);
+			Timer::after(Duration::from_millis(50)).await;
+
+			hue = hue.wrapping_add(2);
+		}
+	}
+}

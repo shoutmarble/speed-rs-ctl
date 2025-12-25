@@ -7,8 +7,7 @@
 )]
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
-use speed::tft::color_wheel;
+use speed::demo;
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
@@ -23,7 +22,6 @@ use esp_hal::{
 use embedded_graphics::{
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
 };
 use embedded_hal_bus::spi::ExclusiveDevice;
 use log::info;
@@ -104,43 +102,9 @@ async fn main(_spawner: Spawner) -> ! {
 
     backlight.set_high();
 
-    // Simple test pattern: clear + a few rectangles.
-    display.clear(Rgb565::BLACK).unwrap();
-
-    let size = display.size();
-    let bar_h = size.height / 3;
-
-    Rectangle::new(Point::new(0, 0), Size::new(size.width, bar_h))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
-        .draw(&mut display)
-        .unwrap();
-
-    Rectangle::new(
-        Point::new(0, bar_h as i32),
-        Size::new(size.width, bar_h),
-    )
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::GREEN))
-        .draw(&mut display)
-        .unwrap();
-
-    Rectangle::new(
-        Point::new(0, (bar_h * 2) as i32),
-        Size::new(size.width, size.height - bar_h * 2),
-    )
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
-        .draw(&mut display)
-        .unwrap();
+    demo::draw_test_bars(&mut display).unwrap();
 
     info!("TFT init done. Cycling colors...");
 
-    let mut hue: u8 = 0;
-    loop {
-        // “Blink” through the color wheel: show a hue, briefly blank, next hue.
-        display.clear(color_wheel(hue)).unwrap();
-        Timer::after(Duration::from_millis(150)).await;
-        display.clear(Rgb565::BLACK).unwrap();
-        Timer::after(Duration::from_millis(50)).await;
-
-        hue = hue.wrapping_add(2);
-    }
+    demo::cycle_hues(&mut display).await
 }
