@@ -1,4 +1,6 @@
-espflash flash .\target\xtensa-esp32s3-none-elf\release\tft
+> flash adafruit esp32s3 tft heather
+> > espflash flash .\target\xtensa-esp32s3-none-elf\release\tft
+
 
   Id CommandLine
   -- -----------
