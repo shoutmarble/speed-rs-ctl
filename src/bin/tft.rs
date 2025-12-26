@@ -7,6 +7,7 @@
 )]
 
 use embassy_executor::Spawner;
+use embassy_time::{Duration, Timer};
 use speed::demo;
 use esp_hal::{
     clock::CpuClock,
@@ -18,10 +19,6 @@ use esp_hal::{
     },
     time::Rate,
     timer::timg::TimerGroup,
-};
-use embedded_graphics::{
-    pixelcolor::Rgb565,
-    prelude::*,
 };
 use embedded_hal_bus::spi::ExclusiveDevice;
 use log::info;
@@ -104,7 +101,9 @@ async fn main(_spawner: Spawner) -> ! {
 
     demo::draw_test_bars(&mut display).unwrap();
 
-    info!("TFT init done. Cycling colors...");
+    info!("TFT init done. (Color cycling removed.)");
 
-    demo::cycle_hues(&mut display).await
+    loop {
+        Timer::after(Duration::from_secs(60)).await;
+    }
 }

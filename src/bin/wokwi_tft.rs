@@ -7,6 +7,7 @@
 )]
 
 use embassy_executor::Spawner;
+use embassy_time::{Duration, Timer};
 use speed::demo;
 use esp_hal::{
     clock::CpuClock,
@@ -18,10 +19,6 @@ use esp_hal::{
     },
     time::Rate,
     timer::timg::TimerGroup,
-};
-use embedded_graphics::{
-    pixelcolor::Rgb565,
-    prelude::*,
 };
 use embedded_hal_bus::spi::ExclusiveDevice;
 use log::info;
@@ -84,7 +81,9 @@ async fn main(_spawner: Spawner) -> ! {
 
     demo::draw_test_bars(&mut display).unwrap();
 
-    info!("Wokwi TFT demo running.");
+    info!("Wokwi TFT demo running. (Color cycling removed.)");
 
-    demo::cycle_hues(&mut display).await
+    loop {
+        Timer::after(Duration::from_secs(60)).await;
+    }
 }

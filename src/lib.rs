@@ -1,7 +1,9 @@
-#![no_std]
+#![cfg_attr(feature = "esp", no_std)]
 
+#[cfg(feature = "esp")]
 use esp_backtrace as _;
 
+#[cfg(feature = "esp")]
 pub mod tft {
 	use embedded_graphics::pixelcolor::Rgb565;
 
@@ -36,8 +38,8 @@ pub mod tft {
 	}
 }
 
+#[cfg(feature = "esp")]
 pub mod demo {
-	use embassy_time::{Duration, Timer};
 	use embedded_graphics::{
 		pixelcolor::Rgb565,
 		prelude::*,
@@ -71,18 +73,4 @@ pub mod demo {
 		Ok(())
 	}
 
-	pub async fn cycle_hues<D>(display: &mut D) -> !
-	where
-		D: DrawTarget<Color = Rgb565>,
-	{
-		let mut hue: u8 = 0;
-		loop {
-			let _ = display.clear(super::tft::color_wheel(hue));
-			Timer::after(Duration::from_millis(150)).await;
-			let _ = display.clear(Rgb565::BLACK);
-			Timer::after(Duration::from_millis(50)).await;
-
-			hue = hue.wrapping_add(2);
-		}
-	}
 }

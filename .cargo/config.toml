@@ -1,11 +1,18 @@
-# Ensure `cargo build` defaults to the ESP32-S3 target.
-# Without this, Cargo will try to build for the host (Windows), which breaks esp-* crates.
+# Default builds target the host.
+# For ESP32-S3 builds, use the aliases below.
 
-[build]
-target = "xtensa-esp32s3-none-elf"
+[alias]
+esp-build = "build --target xtensa-esp32s3-none-elf --no-default-features --features esp -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+esp-build-release = "build --release --target xtensa-esp32s3-none-elf --no-default-features --features esp -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+esp-build-speed = "build --bin speed --target xtensa-esp32s3-none-elf --no-default-features --features esp -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+esp-build-speed-release = "build --release --bin speed --target xtensa-esp32s3-none-elf --no-default-features --features esp -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+esp-build-tft = "build --bin tft --target xtensa-esp32s3-none-elf --no-default-features --features esp -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+esp-build-tft-release = "build --release --bin tft --target xtensa-esp32s3-none-elf --no-default-features --features esp -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+esp-build-wokwi-tft = "build --bin wokwi_tft --target xtensa-esp32s3-none-elf --no-default-features --features esp -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+esp-build-wokwi-tft-release = "build --release --bin wokwi_tft --target xtensa-esp32s3-none-elf --no-default-features --features esp -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+esp-build-slint-tft = "build --bin slint_tft --target xtensa-esp32s3-none-elf --no-default-features --features esp,slint-mcu -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+esp-build-slint-tft-release = "build --release --bin slint_tft --target xtensa-esp32s3-none-elf --no-default-features --features esp,slint-mcu -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
-# The esp toolchain includes Rust source but not prebuilt core/alloc for xtensa targets.
-# Build them from source as part of the build.
-[unstable]
-build-std = ["core", "alloc"]
-build-std-features = ["compiler-builtins-mem"]
+# Build all ESP32-S3 bins (speed/tft/wokwi_tft/slint_tft) in one go.
+esp-build-all = "build --bins --target xtensa-esp32s3-none-elf --no-default-features --features esp,slint-mcu -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+esp-build-all-release = "build --release --bins --target xtensa-esp32s3-none-elf --no-default-features --features esp,slint-mcu -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"

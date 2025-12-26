@@ -1,0 +1,24 @@
+export component CounterWindow inherits Window {
+    in-out property <int> counter: 0;
+    in-out property <int> heartbeat: 0;
+
+    width: 240px;
+    height: 135px;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 6px;
+
+        Text {
+            text: "Counter: " + counter;
+            horizontal-alignment: center;
+            font-size: 28px;
+        }
+
+        Text {
+            text: "Heartbeat: " + heartbeat;
+            horizontal-alignment: center;
+            font-size: 18px;
+        }
+    }
+}

@@ -2,24 +2,75 @@
 edition      = "2024"
 name         = "speed"
 rust-version = "1.88"
-version      = "0.1.0"
+version      = "0.2.0"
+autobins     = false
 
 [[bin]]
 name = "speed"
 path = "./src/bin/main.rs"
+required-features = ["esp"]
 
 [[bin]]
 name = "tft"
 path = "./src/bin/tft.rs"
+required-features = ["esp"]
 
 [[bin]]
 name = "wokwi_tft"
 path = "./src/bin/wokwi_tft.rs"
+required-features = ["esp"]
+
+[[bin]]
+name = "slint_tft"
+path = "./src/bin/slint_tft.rs"
+required-features = ["esp", "slint-mcu"]
+
+[features]
+default = []
+slint-mcu = [
+  "dep:slint",
+  "dep:slint-build",
+  "slint/compat-1-2",
+  "slint/unsafe-single-threaded",
+  "slint/libm",
+  "slint/renderer-software",
+]
+esp = [
+  "dep:esp-hal",
+  "dep:esp-rtos",
+  "dep:esp-bootloader-esp-idf",
+  "dep:embassy-net",
+  "dep:embassy-futures",
+  "dep:embassy-sync",
+  "dep:embedded-hal",
+  "dep:embedded-io",
+  "dep:embedded-io-async",
+  "dep:esp-alloc",
+  "dep:esp-println",
+  "dep:esp-backtrace",
+  "dep:bt-hci",
+  "dep:embassy-executor",
+  "dep:embassy-time",
+  "dep:esp-radio",
+  "dep:smoltcp",
+  "dep:trouble-host",
+  "dep:critical-section",
+  "dep:static_cell",
+  "dep:embedded-graphics",
+  "dep:embedded-hal-bus",
+  "dep:mipidsi",
+]
 
 [dependencies]
-esp-hal = { version = "~1.0", features = ["esp32s3", "log-04", "unstable"] }
+log = "0.4.27"
 
-esp-rtos = { version = "0.2.0", features = [
+embedded-hal = { version = "1.0.0", optional = true }
+
+slint = { version = "1.14.1", default-features = false, optional = true }
+
+esp-hal = { version = "~1.0", optional = true, features = ["esp32s3", "log-04", "psram", "unstable"] }
+
+esp-rtos = { version = "0.2.0", optional = true, features = [
   "embassy",
   "esp-alloc",
   "esp-radio",
@@ -27,26 +78,27 @@ esp-rtos = { version = "0.2.0", features = [
   "log-04",
 ] }
 
-esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32s3", "log-04"] }
-log                    = "0.4.27"
+esp-bootloader-esp-idf = { version = "0.4.0", optional = true, features = ["esp32s3", "log-04"] }
 
-embassy-net = { version = "0.7.1", features = [
+embassy-net = { version = "0.7.1", optional = true, features = [
   "dhcpv4",
   "log",
   "medium-ethernet",
   "tcp",
   "udp",
 ] }
-embedded-io = "0.7.1"
-embedded-io-async = "0.7.0"
-esp-alloc = "0.9.0"
-esp-println = { version = "0.16.1", features = ["esp32s3", "log-04"] }
-esp-backtrace = { version = "0.18.1", features = ["esp32s3", "panic-handler", "println"] }
+embedded-io = { version = "0.7.1", optional = true }
+embedded-io-async = { version = "0.7.0", optional = true }
+esp-alloc = { version = "0.9.0", optional = true }
+esp-println = { version = "0.16.1", optional = true, features = ["esp32s3", "log-04"] }
+esp-backtrace = { version = "0.18.1", optional = true, features = ["esp32s3", "panic-handler", "println"] }
 # for more networking protocol support see https://crates.io/crates/edge-net
-bt-hci = "0.6.0"
-embassy-executor = { version = "0.9.1", features = ["log"] }
-embassy-time = { version = "0.5.0", features = ["log"] }
-esp-radio = { version = "0.17.0", features = [
+bt-hci = { version = "0.6.0", optional = true }
+embassy-executor = { version = "0.9.1", optional = true, features = ["log"] }
+embassy-futures = { version = "0.1.2", optional = true }
+embassy-sync = { version = "0.7.2", optional = true }
+embassy-time = { version = "0.5.0", optional = true, features = ["log"] }
+esp-radio = { version = "0.17.0", optional = true, features = [
   "ble",
   "coex",
   "esp-alloc",
@@ -56,7 +108,7 @@ esp-radio = { version = "0.17.0", features = [
   "unstable",
   "wifi",
 ] }
-smoltcp = { version = "0.12.0", default-features = false, features = [
+smoltcp = { version = "0.12.0", optional = true, default-features = false, features = [
   "log",
   "medium-ethernet",
   "multicast",
@@ -69,15 +121,18 @@ smoltcp = { version = "0.12.0", default-features = false, features = [
   "socket-tcp",
   "socket-udp",
 ] }
-trouble-host = { version = "0.5.0", features = ["gatt"] }
+trouble-host = { version = "0.5.0", optional = true, features = ["gatt"] }
 
-critical-section = "1.2.0"
-static_cell      = "2.1.1"
+critical-section = { version = "1.2.0", optional = true }
+static_cell      = { version = "2.1.1", optional = true }
 
 # Display (Adafruit ESP32-S3 TFT Feather / ST7789)
-embedded-graphics = "0.8.1"
-embedded-hal-bus = "0.3.0"
-mipidsi = "0.9.0"
+embedded-graphics = { version = "0.8.1", optional = true }
+embedded-hal-bus = { version = "0.3.0", optional = true }
+mipidsi = { version = "0.9.0", optional = true }
+
+[build-dependencies]
+slint-build = { version = "1.14.1", optional = true }
 
 
 [profile.dev]
