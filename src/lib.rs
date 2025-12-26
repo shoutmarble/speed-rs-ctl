@@ -74,3 +74,6 @@ pub mod demo {
 	}
 
 }
+
+#[cfg(feature = "esp")]
+pub mod wifi;

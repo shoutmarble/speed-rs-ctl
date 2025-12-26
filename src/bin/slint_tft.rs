@@ -34,6 +34,8 @@ use mipidsi::options::{ColorInversion, ColorOrder, Orientation, Rotation};
 use mipidsi::Builder;
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 use slint::platform::{Platform, PlatformError, WindowAdapter};
+use speed::wifi::{WifiConnState, WifiUiState, WIFI_SSIDS};
+use static_cell::StaticCell;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -90,6 +92,12 @@ static FRAME_ENABLE: Watch<CriticalSectionRawMutex, bool, 1> = Watch::new_with(f
 // Wake the UI loop without queueing an event (coalesces automatically).
 static UI_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+// Wi-Fi connection status for the UI.
+static WIFI_UI: Watch<CriticalSectionRawMutex, WifiUiState, 1> = Watch::new_with(WifiUiState::disconnected());
+
+// The esp-radio controller must live for 'static so Wi-Fi tasks can be spawned.
+static RADIO_INIT: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
+
 fn apply_event(item: UiEventItem, _ui: &CounterWindow, window: &Rc<MinimalSoftwareWindow>) {
     match item.event {
         UiEvent::Redraw | UiEvent::Frame => {
@@ -111,6 +119,7 @@ fn drain_ui_events(
     rx_hi: &PrioReceiver<'static, CriticalSectionRawMutex, UiEventItem, Max, 4>,
     counter_rx: &mut WatchDynReceiver<'static, i32>,
     heartbeat_rx: &mut WatchDynReceiver<'static, i32>,
+    wifi_rx: &mut WatchDynReceiver<'static, WifiUiState>,
     ui: &CounterWindow,
     window: &Rc<MinimalSoftwareWindow>,
 ) {
@@ -133,6 +142,15 @@ fn drain_ui_events(
 
     if let Some(value) = heartbeat_rx.try_changed() {
         ui.set_heartbeat(value);
+        redraw = true;
+    }
+
+    if let Some(value) = wifi_rx.try_changed() {
+        let idx = (value.ssid_idx as usize).min(WIFI_SSIDS.len().saturating_sub(1));
+        ui.set_wifi_ssid(WIFI_SSIDS[idx].into());
+        ui.set_wifi_state(value.state as i32);
+        ui.set_wifi_attempt(value.attempt as i32);
+        ui.set_wifi_blink(value.blink_on);
         redraw = true;
     }
 
@@ -275,11 +293,14 @@ impl<
         let buffer = &mut self.buffer[range.clone()];
         render_fn(buffer);
 
+        // mipidsi's set_pixels uses inclusive end coordinates; Range::end is exclusive.
+        // Passing an out-of-range end coordinate is undefined behavior.
+        let x_end_inclusive = (range.end - 1) as u16;
         self.display
             .set_pixels(
                 range.start as u16,
                 line as u16,
-                range.end as u16,
+                x_end_inclusive,
                 line as u16,
                 buffer.iter().map(|x| RawU16::new(x.0).into()),
             )
@@ -289,7 +310,9 @@ impl<
 
 #[esp_rtos::main]
 async fn main(_spawner: embassy_executor::Spawner) -> ! {
-    esp_println::logger::init_logger_from_env();
+    // Force INFO so wifi scan/selection logs are always visible.
+    esp_println::logger::init_logger(log::LevelFilter::Info);
+    esp_println::println!("boot: logger initialized (INFO)");
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -298,8 +321,11 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
 
-    // Slint needs a heap. Use PSRAM (available on the Feather TFT).
-    esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
+    // Wi-Fi init requires internal heap (PSRAM-only allocations can fail with ESP_ERR_NO_MEM).
+    // Mirror the setup that works in the main example.
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
+    // COEX/Wi-Fi needs more RAM.
+    esp_alloc::heap_allocator!(size: 64 * 1024);
 
     info!("Starting Slint ST7789 init (Feather TFT pinout)...");
 
@@ -314,6 +340,9 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
 
     // Ensure the panel is powered.
     lcd_pwr.set_high();
+
+    // Turn on the backlight early so failures before display init don't leave it dark.
+    backlight.set_high();
 
     // SPI2 on the Feather TFT pins.
     let spi = Spi::new(
@@ -350,8 +379,6 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         .init(&mut delay)
         .unwrap();
 
-    backlight.set_high();
-
     // Prepare a draw buffer for the Slint software renderer (one line).
     let mut buffer_provider = DrawBuffer {
         display,
@@ -369,11 +396,19 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         .expect("backend already initialized");
 
     let ui = CounterWindow::new().unwrap();
+    ui.set_wifi_ssid(WIFI_SSIDS[0].into());
+    ui.set_wifi_state(WifiConnState::Disconnected as i32);
+    ui.set_wifi_attempt(0);
+    ui.set_wifi_blink(false);
     ui.show().unwrap();
+
+    // Force at least one frame to render.
+    window.request_redraw();
 
     let rx_hi = UI_EVENTS_HI.receiver();
     let mut counter_rx = COUNTER_VALUE.dyn_receiver().unwrap();
     let mut heartbeat_rx = HEARTBEAT_VALUE.dyn_receiver().unwrap();
+    let mut wifi_rx = WIFI_UI.dyn_receiver().unwrap();
     let frame_enable_tx = FRAME_ENABLE.dyn_sender();
     let frame_enable_rx = FRAME_ENABLE.dyn_receiver().unwrap();
 
@@ -384,6 +419,27 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     _spawner.must_spawn(button_task(button, UI_EVENTS_HI.sender()));
     _spawner.must_spawn(frame_pacer_task(frame_enable_rx, UI_EVENTS_HI.sender()));
     _spawner.must_spawn(housekeeping_task(UI_EVENTS_HI.sender()));
+    // Set up Wi-Fi controller and spawn the connect task.
+    match esp_radio::init() {
+        Ok(controller) => {
+            let radio_init = RADIO_INIT.init(controller);
+            match esp_radio::wifi::new(radio_init, peripherals.WIFI, Default::default()) {
+                Ok((wifi_controller, ifaces)) => {
+                    _spawner.must_spawn(speed::wifi::wifi_connect_task(
+                        wifi_controller,
+                        ifaces,
+                        WIFI_UI.dyn_sender(),
+                    ));
+                }
+                Err(e) => {
+                    log::warn!("wifi: init controller failed: {e:?}");
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("wifi: esp_radio::init failed: {e:?}");
+        }
+    }
 
     info!("Display initialized, entering async Slint render loop...");
 
@@ -394,7 +450,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         slint::platform::update_timers_and_animations();
 
         // Coalesce any pending updates before rendering.
-        drain_ui_events(&rx_hi, &mut counter_rx, &mut heartbeat_rx, &ui, &window);
+        drain_ui_events(&rx_hi, &mut counter_rx, &mut heartbeat_rx, &mut wifi_rx, &ui, &window);
 
         // 2) Render if needed.
         window.draw_if_needed(|renderer| {
@@ -402,7 +458,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         });
 
         // Coalesce any pending updates that happened during render.
-        drain_ui_events(&rx_hi, &mut counter_rx, &mut heartbeat_rx, &ui, &window);
+        drain_ui_events(&rx_hi, &mut counter_rx, &mut heartbeat_rx, &mut wifi_rx, &ui, &window);
 
         // If Slint has active animations, keep driving frames while still reacting to input.
         let anim_enabled = window.window().has_active_animations();
@@ -414,7 +470,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         if anim_enabled {
             window.request_redraw();
 
-            let state_changed = select(counter_rx.changed(), heartbeat_rx.changed());
+            let state_changed = select3(counter_rx.changed(), heartbeat_rx.changed(), wifi_rx.changed());
             match select(
                 select3(
                     rx_hi.receive(),
@@ -426,12 +482,20 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
             .await {
                 Either::First(result) => match result {
                     Either3::First(item) => apply_event(item, &ui, &window),
-                    Either3::Second(Either::First(value)) => {
+                    Either3::Second(Either3::First(value)) => {
                         ui.set_counter(value);
                         window.request_redraw();
                     }
-                    Either3::Second(Either::Second(value)) => {
+                    Either3::Second(Either3::Second(value)) => {
                         ui.set_heartbeat(value);
+                        window.request_redraw();
+                    }
+                    Either3::Second(Either3::Third(value)) => {
+                        let idx = (value.ssid_idx as usize).min(WIFI_SSIDS.len().saturating_sub(1));
+                        ui.set_wifi_ssid(WIFI_SSIDS[idx].into());
+                        ui.set_wifi_state(value.state as i32);
+                        ui.set_wifi_attempt(value.attempt as i32);
+                        ui.set_wifi_blink(value.blink_on);
                         window.request_redraw();
                     }
                     Either3::Third(()) => {
@@ -444,7 +508,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
                     window.request_redraw();
                 }
             }
-            drain_ui_events(&rx_hi, &mut counter_rx, &mut heartbeat_rx, &ui, &window);
+            drain_ui_events(&rx_hi, &mut counter_rx, &mut heartbeat_rx, &mut wifi_rx, &ui, &window);
             continue;
         }
 
@@ -458,7 +522,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
             match select(
                 select3(
                     rx_hi.receive(),
-                    select(counter_rx.changed(), heartbeat_rx.changed()),
+                    select3(counter_rx.changed(), heartbeat_rx.changed(), wifi_rx.changed()),
                     UI_WAKE.wait(),
                 ),
                 Timer::after(wait),
@@ -466,12 +530,20 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
             .await {
                 Either::First(result) => match result {
                     Either3::First(item) => apply_event(item, &ui, &window),
-                    Either3::Second(Either::First(value)) => {
+                    Either3::Second(Either3::First(value)) => {
                         ui.set_counter(value);
                         window.request_redraw();
                     }
-                    Either3::Second(Either::Second(value)) => {
+                    Either3::Second(Either3::Second(value)) => {
                         ui.set_heartbeat(value);
+                        window.request_redraw();
+                    }
+                    Either3::Second(Either3::Third(value)) => {
+                        let idx = (value.ssid_idx as usize).min(WIFI_SSIDS.len().saturating_sub(1));
+                        ui.set_wifi_ssid(WIFI_SSIDS[idx].into());
+                        ui.set_wifi_state(value.state as i32);
+                        ui.set_wifi_attempt(value.attempt as i32);
+                        ui.set_wifi_blink(value.blink_on);
                         window.request_redraw();
                     }
                     Either3::Third(()) => {
@@ -485,18 +557,26 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         } else {
             // No timers pending: block until an event arrives (HI has priority).
             match select(
-                select(rx_hi.receive(), select(counter_rx.changed(), heartbeat_rx.changed())),
+                select(rx_hi.receive(), select3(counter_rx.changed(), heartbeat_rx.changed(), wifi_rx.changed())),
                 UI_WAKE.wait(),
             )
             .await {
                 Either::First(result) => match result {
                     Either::First(item) => apply_event(item, &ui, &window),
-                    Either::Second(Either::First(value)) => {
+                    Either::Second(Either3::First(value)) => {
                         ui.set_counter(value);
                         window.request_redraw();
                     }
-                    Either::Second(Either::Second(value)) => {
+                    Either::Second(Either3::Second(value)) => {
                         ui.set_heartbeat(value);
+                        window.request_redraw();
+                    }
+                    Either::Second(Either3::Third(value)) => {
+                        let idx = (value.ssid_idx as usize).min(WIFI_SSIDS.len().saturating_sub(1));
+                        ui.set_wifi_ssid(WIFI_SSIDS[idx].into());
+                        ui.set_wifi_state(value.state as i32);
+                        ui.set_wifi_attempt(value.attempt as i32);
+                        ui.set_wifi_blink(value.blink_on);
                         window.request_redraw();
                     }
                 },
@@ -507,6 +587,6 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         }
 
         // Also apply any queued events that may have raced with the wait.
-        drain_ui_events(&rx_hi, &mut counter_rx, &mut heartbeat_rx, &ui, &window);
+        drain_ui_events(&rx_hi, &mut counter_rx, &mut heartbeat_rx, &mut wifi_rx, &ui, &window);
     }
 }
