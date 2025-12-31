@@ -2,6 +2,11 @@
 
 ESP32-S3 firmware project using Embassy + Rust.
 
+## Demo
+
+![ESP32-S3 TFT running the UI](assets/device.jpg)
+
+
 ## Prerequisites
 
 - Rust toolchain (installed via `rustup`)
