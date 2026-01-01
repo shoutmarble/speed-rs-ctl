@@ -7,6 +7,10 @@ ESP32-S3 firmware project using Embassy + Rust.
 ![ESP32-S3 TFT running the UI](assets/device.jpg)
 
 ## MOST COMMON COMMANDS QUICK REFERENCE 
+```powershell
+cargo esp-build-all-release
+```
+
 ```
 cargo run --bin web_gui --features web_gui
 ```
