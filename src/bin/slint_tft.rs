@@ -36,6 +36,9 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use speed::wifi::{WifiConnState, WifiUiState, WIFI_SSIDS};
 use static_cell::StaticCell;
+use embassy_net::{Config, Stack, StackResources};
+use embassy_net::tcp::TcpSocket;
+use embedded_io_async::Write;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -81,7 +84,8 @@ impl UiEventItem {
 static UI_EVENTS_HI: PriorityChannel<CriticalSectionRawMutex, UiEventItem, Max, 4> = PriorityChannel::new();
 
 // Latest counter value as state (not a queue). This ensures the UI always sees the newest value.
-static COUNTER_VALUE: Watch<CriticalSectionRawMutex, i32, 1> = Watch::new_with(0);
+// We need two receivers: one for the UI loop and one for the network post task.
+static COUNTER_VALUE: Watch<CriticalSectionRawMutex, i32, 2> = Watch::new_with(0);
 
 // Another piece of shared UI state: a simple heartbeat counter.
 static HEARTBEAT_VALUE: Watch<CriticalSectionRawMutex, i32, 1> = Watch::new_with(0);
@@ -94,6 +98,9 @@ static UI_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 // Wi-Fi connection status for the UI.
 static WIFI_UI: Watch<CriticalSectionRawMutex, WifiUiState, 1> = Watch::new_with(WifiUiState::disconnected());
+
+// Network stack resources.
+static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
 
 // The esp-radio controller must live for 'static so Wi-Fi tasks can be spawned.
 static RADIO_INIT: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
@@ -270,6 +277,54 @@ async fn housekeeping_task(tx: PrioSender<'static, CriticalSectionRawMutex, UiEv
     }
 }
 
+#[embassy_executor::task]
+async fn post_task(stack: Stack<'static>, mut counter_rx: WatchDynReceiver<'static, i32>) {
+    let mut logged_config = false;
+    loop {
+        // Do not attempt any TCP traffic until the link is up and DHCP has provided
+        // a usable IPv4 configuration.
+        stack.wait_link_up().await;
+        stack.wait_config_up().await;
+
+        if !logged_config {
+            logged_config = true;
+            log::info!("post_task: IPv4 config up: {:?}", stack.config_v4());
+        }
+
+        Timer::after(EmbassyDuration::from_secs(5)).await;
+
+        if !stack.is_link_up() {
+            continue;
+        }
+
+        let value = counter_rx.try_get().unwrap_or(0);
+        // post value
+        let mut rx_buffer = [0; 1024];
+        let mut tx_buffer = [0; 1024];
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(EmbassyDuration::from_secs(10)));
+        let addr = embassy_net::Ipv4Address::new(192, 168, 0, 173);
+        if let Err(e) = socket.connect((addr, 8080)).await {
+            log::warn!("connect failed: {:?}", e);
+            continue;
+        }
+        let body = alloc::format!("{{\"count\": {}}}", value);
+        let request = alloc::format!("POST /counter HTTP/1.1\r\nHost: 192.168.0.173\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+        if let Err(e) = socket.write_all(request.as_bytes()).await {
+            log::warn!("write failed: {:?}", e);
+            continue;
+        }
+        let mut buf = [0; 1024];
+        let _ = socket.read(&mut buf).await;
+        socket.close();
+    }
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: embassy_net::Runner<'static, esp_radio::wifi::WifiDevice<'static>>) -> ! {
+    runner.run().await
+}
+
 /// Provides a draw buffer for the MinimalSoftwareWindow renderer.
 struct DrawBuffer<'a, Display> {
     display: Display,
@@ -427,9 +482,21 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
                 Ok((wifi_controller, ifaces)) => {
                     _spawner.must_spawn(speed::wifi::wifi_connect_task(
                         wifi_controller,
-                        ifaces,
                         WIFI_UI.dyn_sender(),
                     ));
+                    // Set up network stack
+                    let config = Config::dhcpv4(Default::default());
+                    let (stack, runner) = embassy_net::new(
+                        ifaces.sta,
+                        config,
+                        STACK_RESOURCES.init(StackResources::new()),
+                        123456789,
+                    );
+
+                    _spawner.must_spawn(net_task(runner));
+                    // Spawn post task
+                    let counter_rx_post = COUNTER_VALUE.dyn_receiver().unwrap();
+                    _spawner.must_spawn(post_task(stack, counter_rx_post));
                 }
                 Err(e) => {
                     log::warn!("wifi: init controller failed: {e:?}");

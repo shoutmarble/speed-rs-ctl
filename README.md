@@ -6,12 +6,24 @@ ESP32-S3 firmware project using Embassy + Rust.
 
 ![ESP32-S3 TFT running the UI](assets/device.jpg)
 
+## MOST COMMON COMMANDS QUICK REFERENCE 
+```
+cargo run --bin web_gui --features web_gui
+```
+
+```powershell
+espflash flash --port COM3 -M target\xtensa-esp32s3-none-elf\release\slint_tft
+```
+
 
 ## Prerequisites
 
 - Rust toolchain (installed via `rustup`)
 - Windows PowerShell (examples below use PowerShell)
 - A connected ESP32-S3 board (e.g. Adafruit ESP32-S3 TFT Feather)
+
+## Install Build Essentials (Part of RustUp Installation)
+```winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"```
 
 ## Install tools
 
@@ -38,7 +50,7 @@ cargo install esp-config --features=tui --locked
 Optional: Probe-rs tools installer script (PowerShell):
 
 ```powershell
-irm https://github.com/probe-rs/probe-rs/releases/download/v0.30.0/probe-rs-tools-installer.ps1
+irm https://github.com/probe-rs/probe-rs/releases/latest/download/probe-rs-tools-installer.ps1 | iex
 ```
 
 Optional: create a new project (example):
@@ -61,6 +73,11 @@ Build just the Slint TFT app (release):
 
 ```powershell
 cargo esp-build-slint-tft-release
+```
+
+## RUN DESKTOP GUI
+```
+cargo run --bin web_gui --features web_gui
 ```
 
 ## Flash

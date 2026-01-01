@@ -5,7 +5,6 @@ use embassy_time::{Duration as EmbassyDuration, Ticker, Timer};
 use esp_radio::wifi::{
     AuthMethod,
     ClientConfig,
-    Interfaces,
     ModeConfig,
     ScanConfig,
     WifiController,
@@ -45,7 +44,6 @@ impl WifiUiState {
 #[embassy_executor::task]
 pub async fn wifi_connect_task(
     mut controller: WifiController<'static>,
-    _ifaces: Interfaces<'static>,
     tx: WatchDynSender<'static, WifiUiState>,
 ) {
     tx.send(WifiUiState::disconnected());
@@ -108,100 +106,177 @@ pub async fn wifi_connect_task(
         }
     }
 
-    // Preserve the original UX contract: stop after WIFI_MAX_ATTEMPTS attempts.
-    // But on each attempt, choose the best (strongest) visible SSID among our candidates.
-    for attempt in 1..=WIFI_MAX_ATTEMPTS {
-        let (ssid_idx, ssid) = match controller.scan_with_config(ScanConfig::default()) {
-            Ok(aps) => {
-                // Choose the strongest candidate by RSSI.
-                let mut best: Option<(u8, &str, i8)> = None;
-                for (idx, candidate) in WIFI_SSIDS.iter().enumerate() {
-                    let idx_u8 = idx as u8;
-                    if let Some(ap) = aps.iter().filter(|ap| ap.ssid == *candidate).max_by_key(|ap| ap.signal_strength) {
-                        let rssi = ap.signal_strength;
-                        info!("wifi: candidate ssid='{}' visible rssi={} channel={} auth={:?}", ap.ssid, rssi, ap.channel, ap.auth_method);
-                        match best {
-                            None => best = Some((idx_u8, *candidate, rssi)),
-                            Some((_, _, best_rssi)) if rssi > best_rssi => best = Some((idx_u8, *candidate, rssi)),
-                            _ => {}
+    // Keep the controller alive for the lifetime of the program.
+    // If we `return` after connecting, the controller is dropped and Wi-Fi is stopped,
+    // which can lead to crashes when the network stack attempts to transmit.
+    loop {
+        // On each attempt, choose the best (strongest) visible SSID among our candidates.
+        for attempt in 1..=WIFI_MAX_ATTEMPTS {
+            let (ssid_idx, ssid) = match controller.scan_with_config(ScanConfig::default()) {
+                Ok(aps) => {
+                    // Choose the strongest candidate by RSSI.
+                    let mut best: Option<(u8, &str, i8)> = None;
+                    for (idx, candidate) in WIFI_SSIDS.iter().enumerate() {
+                        let idx_u8 = idx as u8;
+                        if let Some(ap) = aps
+                            .iter()
+                            .filter(|ap| ap.ssid == *candidate)
+                            .max_by_key(|ap| ap.signal_strength)
+                        {
+                            let rssi = ap.signal_strength;
+                            info!(
+                                "wifi: candidate ssid='{}' visible rssi={} channel={} auth={:?}",
+                                ap.ssid,
+                                rssi,
+                                ap.channel,
+                                ap.auth_method
+                            );
+                            match best {
+                                None => best = Some((idx_u8, *candidate, rssi)),
+                                Some((_, _, best_rssi)) if rssi > best_rssi => {
+                                    best = Some((idx_u8, *candidate, rssi))
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            info!("wifi: candidate ssid='{}' not visible", candidate);
                         }
+                    }
+
+                    if let Some((idx, ssid, rssi)) = best {
+                        info!("wifi: selecting ssid='{}' (best rssi={})", ssid, rssi);
+                        (idx, ssid)
                     } else {
-                        info!("wifi: candidate ssid='{}' not visible", candidate);
+                        warn!(
+                            "wifi: none of the candidate SSIDs are visible; defaulting to '{}'",
+                            WIFI_SSIDS[0]
+                        );
+                        (0, WIFI_SSIDS[0])
                     }
                 }
-
-                if let Some((idx, ssid, rssi)) = best {
-                    info!("wifi: selecting ssid='{}' (best rssi={})", ssid, rssi);
-                    (idx, ssid)
-                } else {
-                    warn!("wifi: none of the candidate SSIDs are visible; defaulting to '{}'", WIFI_SSIDS[0]);
+                Err(e) => {
+                    warn!(
+                        "wifi: scan failed during attempt selection: {e:?}; defaulting to '{}'",
+                        WIFI_SSIDS[0]
+                    );
                     (0, WIFI_SSIDS[0])
                 }
+            };
+
+            info!(
+                "wifi: connecting to {} (attempt {}/{})...",
+                ssid,
+                attempt,
+                WIFI_MAX_ATTEMPTS
+            );
+
+            tx.send(WifiUiState {
+                state: WifiConnState::Disconnected,
+                attempt: 0,
+                blink_on: false,
+                ssid_idx,
+            });
+
+            let client_config = ClientConfig::default()
+                .with_ssid(ssid.into())
+                .with_password(WIFI_PASSWORD.into())
+                // User requested WPA; allow WPA or WPA2 personal.
+                .with_auth_method(AuthMethod::WpaWpa2Personal);
+            let mode_config = ModeConfig::Client(client_config);
+
+            if let Err(e) = controller.set_config(&mode_config) {
+                warn!("wifi: set_config failed for ssid='{ssid}': {e:?}");
+                Timer::after(EmbassyDuration::from_secs(1)).await;
+                continue;
             }
-            Err(e) => {
-                warn!("wifi: scan failed during attempt selection: {e:?}; defaulting to '{}'", WIFI_SSIDS[0]);
-                (0, WIFI_SSIDS[0])
+
+            // Ensure we start from a clean state.
+            let _ = controller.disconnect();
+
+            if let Err(e) = controller.connect() {
+                warn!("wifi: connect() failed (ssid='{ssid}') attempt {attempt}: {e:?}");
+                tx.send(WifiUiState {
+                    state: WifiConnState::Disconnected,
+                    attempt,
+                    blink_on: false,
+                    ssid_idx,
+                });
+                Timer::after(EmbassyDuration::from_secs(1)).await;
+                continue;
             }
-        };
 
-        info!("wifi: connecting to {} (attempt {}/{})...", ssid, attempt, WIFI_MAX_ATTEMPTS);
+            // Wait for the STA state to become connected, while blinking.
+            let mut blink = false;
+            let mut ticker = Ticker::every(EmbassyDuration::from_millis(500));
+            let deadline_ticks: u8 = 60; // ~30s total
 
-        tx.send(WifiUiState { state: WifiConnState::Disconnected, attempt: 0, blink_on: false, ssid_idx });
+            let mut last_state_dbg = alloc::format!("{:?}", sta_state());
 
-        let client_config = ClientConfig::default()
-            .with_ssid(ssid.into())
-            .with_password(WIFI_PASSWORD.into())
-            // User requested WPA; allow WPA or WPA2 personal.
-            .with_auth_method(AuthMethod::WpaWpa2Personal);
-        let mode_config = ModeConfig::Client(client_config);
+            for _ in 0..deadline_ticks {
+                let state = sta_state();
+                let state_dbg = alloc::format!("{:?}", state);
+                if state_dbg != last_state_dbg {
+                    info!("wifi: sta_state (ssid='{ssid}') = {state_dbg}");
+                    last_state_dbg = state_dbg;
+                }
 
-        if let Err(e) = controller.set_config(&mode_config) {
-            warn!("wifi: set_config failed for ssid='{ssid}': {e:?}");
+                if matches!(state, WifiStaState::Connected) {
+                    info!("wifi: connected to {}", ssid);
+                    tx.send(WifiUiState {
+                        state: WifiConnState::Connected,
+                        attempt,
+                        blink_on: false,
+                        ssid_idx,
+                    });
+
+                    // Stay alive while connected. If we disconnect, restart attempts.
+                    loop {
+                        Timer::after(EmbassyDuration::from_secs(1)).await;
+                        if !matches!(sta_state(), WifiStaState::Connected) {
+                            warn!("wifi: disconnected from {}", ssid);
+                            tx.send(WifiUiState {
+                                state: WifiConnState::Disconnected,
+                                attempt,
+                                blink_on: false,
+                                ssid_idx,
+                            });
+                            break;
+                        }
+                    }
+
+                    // Break out of attempt loop and start over.
+                    break;
+                }
+
+                blink = !blink;
+                tx.send(WifiUiState {
+                    state: WifiConnState::Connecting,
+                    attempt,
+                    blink_on: blink,
+                    ssid_idx,
+                });
+                ticker.next().await;
+            }
+
+            warn!("wifi: timeout waiting for connection (ssid='{ssid}', attempt {attempt})");
+            tx.send(WifiUiState {
+                state: WifiConnState::Disconnected,
+                attempt,
+                blink_on: false,
+                ssid_idx,
+            });
             Timer::after(EmbassyDuration::from_secs(1)).await;
-            continue;
         }
 
-        // Ensure we start from a clean state.
-        let _ = controller.disconnect();
+        warn!("wifi: giving up after {} attempts", WIFI_MAX_ATTEMPTS);
+        tx.send(WifiUiState {
+            state: WifiConnState::Disconnected,
+            attempt: WIFI_MAX_ATTEMPTS,
+            blink_on: false,
+            ssid_idx: 0,
+        });
 
-        if let Err(e) = controller.connect() {
-            warn!("wifi: connect() failed (ssid='{ssid}') attempt {attempt}: {e:?}");
-            tx.send(WifiUiState { state: WifiConnState::Disconnected, attempt, blink_on: false, ssid_idx });
-            Timer::after(EmbassyDuration::from_secs(1)).await;
-            continue;
-        }
-
-        // Wait for the STA state to become connected, while blinking.
-        let mut blink = false;
-        let mut ticker = Ticker::every(EmbassyDuration::from_millis(500));
-        let deadline_ticks: u8 = 60; // ~30s total
-
-        let mut last_state_dbg = alloc::format!("{:?}", sta_state());
-
-        for _ in 0..deadline_ticks {
-            let state = sta_state();
-            let state_dbg = alloc::format!("{:?}", state);
-            if state_dbg != last_state_dbg {
-                info!("wifi: sta_state (ssid='{ssid}') = {state_dbg}");
-                last_state_dbg = state_dbg;
-            }
-
-            if matches!(state, WifiStaState::Connected) {
-                info!("wifi: connected to {}", ssid);
-                tx.send(WifiUiState { state: WifiConnState::Connected, attempt, blink_on: false, ssid_idx });
-                return;
-            }
-
-            blink = !blink;
-            tx.send(WifiUiState { state: WifiConnState::Connecting, attempt, blink_on: blink, ssid_idx });
-            ticker.next().await;
-        }
-
-        warn!("wifi: timeout waiting for connection (ssid='{ssid}', attempt {attempt})");
-        tx.send(WifiUiState { state: WifiConnState::Disconnected, attempt, blink_on: false, ssid_idx });
-        Timer::after(EmbassyDuration::from_secs(1)).await;
+        // Back off a bit before trying again.
+        Timer::after(EmbassyDuration::from_secs(5)).await;
     }
-
-    warn!("wifi: giving up after {} attempts", WIFI_MAX_ATTEMPTS);
-    tx.send(WifiUiState { state: WifiConnState::Disconnected, attempt: WIFI_MAX_ATTEMPTS, blink_on: false, ssid_idx: 0 });
 }
