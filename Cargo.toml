@@ -2,7 +2,7 @@
 edition      = "2024"
 name         = "speed"
 rust-version = "1.88"
-version      = "0.2.2"
+version      = "0.2.4"
 autobins     = false
 
 [[bin]]
