@@ -15,14 +15,11 @@ espflash flash --port COM3 -M target\xtensa-esp32s3-none-elf\release\slint_tft
 ```
 
 ```
-cargo run --release --bin web_gui --features web_gui
-```
-```
 cargo run --bin web_gui --features web_gui
 ```
-
-
-
+```
+cargo build --release --bin web_gui --features web_gui
+```
 
 
 ## Prerequisites
