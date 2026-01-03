@@ -22,6 +22,7 @@ use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
+use esp_hal::efuse::Efuse;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
@@ -37,8 +38,18 @@ use slint::platform::{Platform, PlatformError, WindowAdapter};
 use speed::wifi::{WifiConnState, WifiUiState, WIFI_SSIDS};
 use static_cell::StaticCell;
 use embassy_net::{Config, Stack, StackResources};
-use embassy_net::tcp::TcpSocket;
+use embassy_net::tcp::{Error as TcpError, TcpSocket};
+use embassy_net::udp::UdpSocket;
 use embedded_io_async::Write;
+use serde::Deserialize;
+
+use rust_mqtt::buffer::AllocBuffer;
+use rust_mqtt::client::event::Event as MqttEvent;
+use rust_mqtt::client::options::{ConnectOptions, PublicationOptions, RetainHandling, SubscriptionOptions};
+use rust_mqtt::client::Client as MqttClient;
+use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
+use rust_mqtt::types::{MqttString, QoS, TopicFilter, TopicName};
+use rust_mqtt::Bytes as MqttBytes;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -87,6 +98,10 @@ static UI_EVENTS_HI: PriorityChannel<CriticalSectionRawMutex, UiEventItem, Max, 
 // We need two receivers: one for the UI loop and one for the network post task.
 static COUNTER_VALUE: Watch<CriticalSectionRawMutex, i32, 2> = Watch::new_with(0);
 
+// External counter override requests (e.g. from web_gui). The counter task applies these
+// to its internal state so the up/down loop continues from the new value.
+static COUNTER_OVERRIDE: Signal<CriticalSectionRawMutex, i32> = Signal::new();
+
 // Another piece of shared UI state: a simple heartbeat counter.
 static HEARTBEAT_VALUE: Watch<CriticalSectionRawMutex, i32, 1> = Watch::new_with(0);
 
@@ -99,8 +114,21 @@ static UI_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 // Wi-Fi connection status for the UI.
 static WIFI_UI: Watch<CriticalSectionRawMutex, WifiUiState, 1> = Watch::new_with(WifiUiState::disconnected());
 
+// Discovered desktop web_gui endpoint (IPv4) via UDP broadcast.
+static WEB_GUI_IPV4: Watch<CriticalSectionRawMutex, Option<embassy_net::Ipv4Address>, 1> = Watch::new_with(None);
+// Discovered desktop MQTT port (typically 1883).
+static WEB_GUI_MQTT_PORT: Watch<CriticalSectionRawMutex, Option<u16>, 1> = Watch::new_with(None);
+
+// Request that the MQTT client tears down and reconnects.
+static MQTT_RECONNECT: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+// Our own network identity (for diagnostics/UI).
+static ESP_IPV4: Watch<CriticalSectionRawMutex, Option<embassy_net::Ipv4Address>, 1> = Watch::new_with(None);
+static ESP_MAC: Watch<CriticalSectionRawMutex, Option<[u8; 6]>, 1> = Watch::new_with(None);
+
 // Network stack resources.
-static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+// Must accommodate DHCPv4 plus our long-lived UDP discovery socket and TCP sockets.
+static STACK_RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
 
 // The esp-radio controller must live for 'static so Wi-Fi tasks can be spawned.
 static RADIO_INIT: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
@@ -127,6 +155,8 @@ fn drain_ui_events(
     counter_rx: &mut WatchDynReceiver<'static, i32>,
     heartbeat_rx: &mut WatchDynReceiver<'static, i32>,
     wifi_rx: &mut WatchDynReceiver<'static, WifiUiState>,
+    esp_ipv4_rx: &mut WatchDynReceiver<'static, Option<embassy_net::Ipv4Address>>,
+    esp_mac_rx: &mut WatchDynReceiver<'static, Option<[u8; 6]>>,
     ui: &CounterWindow,
     window: &Rc<MinimalSoftwareWindow>,
 ) {
@@ -158,6 +188,27 @@ fn drain_ui_events(
         ui.set_wifi_state(value.state as i32);
         ui.set_wifi_attempt(value.attempt as i32);
         ui.set_wifi_blink(value.blink_on);
+        redraw = true;
+    }
+
+    if let Some(ip) = esp_ipv4_rx.try_changed() {
+        let txt: slint::SharedString = match ip {
+            Some(ip) => alloc::format!("{ip}").into(),
+            None => "".into(),
+        };
+        ui.set_wifi_ip(txt);
+        redraw = true;
+    }
+
+    if let Some(mac) = esp_mac_rx.try_changed() {
+        let txt: slint::SharedString = match mac {
+            Some([a, b, c, d, e, f]) => alloc::format!(
+                "{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}"
+            )
+            .into(),
+            None => "".into(),
+        };
+        ui.set_wifi_mac(txt);
         redraw = true;
     }
 
@@ -196,21 +247,25 @@ impl Platform for EspBackend {
 async fn counter_task(tx: WatchDynSender<'static, i32>) {
     let mut value: i32 = 0;
     let mut dir: i32 = 1;
-    let mut ticker = Ticker::every(EmbassyDuration::from_millis(500));
+    let mut ticker = Ticker::every(EmbassyDuration::from_secs(1));
     loop {
-        ticker.next().await;
-
-        value += dir;
-        if value >= 100 {
-            value = 100;
-            dir = -1;
-        } else if value <= 0 {
-            value = 0;
-            dir = 1;
+        match select(ticker.next(), COUNTER_OVERRIDE.wait()).await {
+            Either::First(()) => {
+                value += dir;
+                if value >= 100 {
+                    value = 100;
+                    dir = -1;
+                } else if value <= 0 {
+                    value = 0;
+                    dir = 1;
+                }
+                tx.send(value);
+            }
+            Either::Second(new_value) => {
+                value = new_value.clamp(0, 100);
+                tx.send(value);
+            }
         }
-
-        // Latest-value semantics: overwrite previous value.
-        tx.send(value);
     }
 }
 
@@ -222,6 +277,41 @@ async fn heartbeat_task(tx: WatchDynSender<'static, i32>) {
         ticker.next().await;
         value = value.wrapping_add(1);
         tx.send(value);
+    }
+}
+
+#[embassy_executor::task]
+async fn netinfo_task(
+    stack: Stack<'static>,
+    ipv4_tx: WatchDynSender<'static, Option<embassy_net::Ipv4Address>>,
+    mac_tx: WatchDynSender<'static, Option<[u8; 6]>>,
+) {
+    // MAC is available immediately (from eFuse). Publish once.
+    let mac = Efuse::mac_address();
+    mac_tx.send(Some(mac));
+    log::info!(
+        "net: MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
+    UI_WAKE.signal(());
+
+    let mut last_ip: Option<embassy_net::Ipv4Address> = None;
+
+    loop {
+        stack.wait_link_up().await;
+        stack.wait_config_up().await;
+
+        if let Some(cfg) = stack.config_v4() {
+            let ip = cfg.address.address();
+            if last_ip != Some(ip) {
+                last_ip = Some(ip);
+                ipv4_tx.send(Some(ip));
+                log::info!("net: IPv4={ip}");
+                UI_WAKE.signal(());
+            }
+        }
+
+        Timer::after(EmbassyDuration::from_secs(1)).await;
     }
 }
 
@@ -264,7 +354,8 @@ async fn frame_pacer_task(
 #[embassy_executor::task]
 async fn housekeeping_task(tx: PrioSender<'static, CriticalSectionRawMutex, UiEventItem, Max, 4>) {
     // Periodic background events to exercise PriorityChannel backpressure.
-    let mut ticker = Ticker::every(EmbassyDuration::from_millis(50));
+    // Keep this relatively slow so it doesn't add noise or steal cycles from Wi-Fi/DHCP.
+    let mut ticker = Ticker::every(EmbassyDuration::from_millis(250));
     loop {
         ticker.next().await;
         HOUSEKEEPING_SENT.fetch_add(1, Ordering::Relaxed);
@@ -277,45 +368,497 @@ async fn housekeeping_task(tx: PrioSender<'static, CriticalSectionRawMutex, UiEv
     }
 }
 
+
 #[embassy_executor::task]
-async fn post_task(stack: Stack<'static>, mut counter_rx: WatchDynReceiver<'static, i32>) {
+async fn mqtt_counter_task(
+    stack: Stack<'static>,
+    mut counter_rx: WatchDynReceiver<'static, i32>,
+    mut web_gui_rx: WatchDynReceiver<'static, Option<embassy_net::Ipv4Address>>,
+    mut web_gui_port_rx: WatchDynReceiver<'static, Option<u16>>,
+) {
+    const TOPIC_ESP_COUNTER: &str = "speed/counter/esp";
+    const TOPIC_SET_COUNTER: &str = "speed/counter/set";
+
+    // embassy-net's `TcpSocket` implements `embedded-io-async` v0.6, but `rust-mqtt`
+    // expects v0.7. Implement a small adapter that forwards v0.7 calls into the
+    // v0.6 trait impl, mapping errors into an `embedded-io` v0.7-compatible type.
+    #[derive(Debug)]
+    struct MqttIoError(TcpError);
+
+    impl core::fmt::Display for MqttIoError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "{:?}", self.0)
+        }
+    }
+
+    impl core::error::Error for MqttIoError {}
+
+    impl embedded_io::Error for MqttIoError {
+        fn kind(&self) -> embedded_io::ErrorKind {
+            embedded_io::ErrorKind::Other
+        }
+    }
+
+    struct TcpSocketV7<'a>(TcpSocket<'a>);
+
+    impl<'a> embedded_io_async07::ErrorType for TcpSocketV7<'a> {
+        type Error = MqttIoError;
+    }
+
+    impl<'a> embedded_io_async07::Read for TcpSocketV7<'a> {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            embedded_io_async::Read::read(&mut self.0, buf)
+                .await
+                .map_err(MqttIoError)
+        }
+    }
+
+    impl<'a> embedded_io_async07::Write for TcpSocketV7<'a> {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            embedded_io_async::Write::write(&mut self.0, buf)
+                .await
+                .map_err(MqttIoError)
+        }
+
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            embedded_io_async::Write::flush(&mut self.0)
+                .await
+                .map_err(MqttIoError)
+        }
+    }
+
     let mut logged_config = false;
+
+    // Pre-build MQTT topic name (static) for publishes. (Filters are re-created per reconnect,
+    // because `subscribe()` takes ownership of the filter.)
+    let topic_esp_name = unsafe {
+        TopicName::new_unchecked(MqttString::try_from(TOPIC_ESP_COUNTER).unwrap())
+    };
+
+    let connect_opts = ConnectOptions {
+        clean_start: true,
+        // Larger keepalive reduces broker-side disconnects on slightly lossy Wi-Fi.
+        keep_alive: KeepAlive::Seconds(120),
+        session_expiry_interval: SessionExpiryInterval::EndOnDisconnect,
+        user_name: None,
+        password: None,
+        will: None,
+    };
+
+    let sub_opts = SubscriptionOptions {
+        retain_handling: RetainHandling::NeverSend,
+        retain_as_published: false,
+        no_local: false,
+        qos: QoS::AtMostOnce,
+    };
+
+    let pub_opts = PublicationOptions {
+        retain: false,
+        topic: topic_esp_name,
+        qos: QoS::AtMostOnce,
+    };
+
+    // Reconnect backoff to avoid thrashing on flaky Wi-Fi or blocked SSID/LAN rules.
+    let mut backoff_secs: u64 = 2;
+
     loop {
-        // Do not attempt any TCP traffic until the link is up and DHCP has provided
-        // a usable IPv4 configuration.
         stack.wait_link_up().await;
         stack.wait_config_up().await;
 
         if !logged_config {
             logged_config = true;
-            log::info!("post_task: IPv4 config up: {:?}", stack.config_v4());
+            log::info!("mqtt_counter: IPv4 config up: {:?}", stack.config_v4());
         }
 
-        Timer::after(EmbassyDuration::from_secs(5)).await;
+        let addr = match web_gui_rx.try_get().unwrap_or(None) {
+            Some(ip) => ip,
+            None => {
+                log::warn!("mqtt_counter: no web_gui discovered yet (waiting for UDP announce)");
+                Timer::after(EmbassyDuration::from_secs(2)).await;
+                continue;
+            }
+        };
 
-        if !stack.is_link_up() {
+        let port = web_gui_port_rx.try_get().unwrap_or(None).unwrap_or(1883);
+
+        let mut rx_buffer = [0u8; 4096];
+        let mut tx_buffer = [0u8; 4096];
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        // Keep this >= MQTT keepalive so the socket doesn't time out mid-packet and
+        // trigger reconnect loops.
+        socket.set_timeout(Some(EmbassyDuration::from_secs(120)));
+
+        log::info!("mqtt_counter: connecting to mqtt://{}:{}", addr, port);
+        // Use an explicit, shorter timeout for the TCP handshake so we don't stall
+        // for a long time when the network/SSID blocks client->LAN TCP.
+        let connect_timeout = EmbassyDuration::from_secs(10);
+        match select(socket.connect((addr, port)), Timer::after(connect_timeout)).await {
+            Either::First(connect_res) => {
+                if let Err(e) = connect_res {
+                    log::warn!("mqtt_counter: connect to {}:{} failed: {:?}", addr, port, e);
+                    Timer::after(EmbassyDuration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs.saturating_mul(2)).min(30);
+                    continue;
+                }
+            }
+            Either::Second(()) => {
+                log::warn!(
+                    "mqtt_counter: connect to {}:{} timed out after {:?} (likely blocked by SSID/LAN rules)",
+                    addr,
+                    port,
+                    connect_timeout
+                );
+                Timer::after(EmbassyDuration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs.saturating_mul(2)).min(30);
+                continue;
+            }
+        }
+
+        let mut buffer = AllocBuffer;
+        let mut client: MqttClient<'_, _, _, 4, 8, 8> = MqttClient::new(&mut buffer);
+
+        let client_id = MqttString::try_from("esp32tft").ok();
+        if let Err(e) = client
+            .connect(TcpSocketV7(socket), &connect_opts, client_id)
+            .await
+        {
+            log::warn!("mqtt_counter: MQTT connect failed: {:?}", e);
+            client.abort().await;
+            Timer::after(EmbassyDuration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs.saturating_mul(2)).min(30);
             continue;
         }
 
-        let value = counter_rx.try_get().unwrap_or(0);
-        // post value
-        let mut rx_buffer = [0; 1024];
+        let topic_set_filter = unsafe {
+            TopicFilter::new_unchecked(MqttString::try_from(TOPIC_SET_COUNTER).unwrap())
+        };
+        if let Err(e) = client.subscribe(topic_set_filter, sub_opts).await {
+            log::warn!("mqtt_counter: subscribe failed: {:?}", e);
+            client.abort().await;
+            Timer::after(EmbassyDuration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs.saturating_mul(2)).min(30);
+            continue;
+        }
+
+        log::info!("mqtt_counter: connected to mqtt://{}:{}", addr, port);
+
+        // Connection succeeded; reset backoff.
+        backoff_secs = 2;
+
+        // Publish the counter periodically. This also provides regular MQTT traffic
+        // so the broker sees activity even if there are no inbound messages.
+        let mut send_ticker = Ticker::every(EmbassyDuration::from_secs(5));
+
+        let mut errored = false;
+
+        'connected: loop {
+            match select3(send_ticker.next(), client.poll_header(), MQTT_RECONNECT.wait()).await {
+                Either3::First(()) => {
+                    let value = counter_rx.try_get().unwrap_or(0).clamp(0, 100);
+                    let payload = alloc::format!("{}", value);
+                    let message: MqttBytes<'_> = payload.as_str().into();
+                    if let Err(e) = client.publish(&pub_opts, message).await {
+                        log::warn!("mqtt_counter: publish failed: {:?}", e);
+                        client.abort().await;
+                        errored = true;
+                        break 'connected;
+                    }
+                }
+                Either3::Second(header_res) => {
+                    let header = match header_res {
+                        Ok(h) => h,
+                        Err(e) => {
+                            log::warn!("mqtt_counter: poll header failed: {:?}", e);
+                            client.abort().await;
+                            errored = true;
+                            break 'connected;
+                        }
+                    };
+
+                    let event = match client.poll_body(header).await {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            log::warn!("mqtt_counter: poll body failed: {:?}", e);
+                            client.abort().await;
+                            errored = true;
+                            break 'connected;
+                        }
+                    };
+
+                    if let MqttEvent::Publish(p) = event
+                        && p.topic.as_ref() == TOPIC_SET_COUNTER
+                    {
+                        let payload = core::str::from_utf8(p.message.as_ref()).unwrap_or("");
+                        if let Ok(v) = payload.trim().parse::<i32>() {
+                            let v = v.clamp(0, 100);
+                            COUNTER_OVERRIDE.signal(v);
+                        }
+                    }
+                }
+                Either3::Third(()) => {
+                    log::info!("mqtt_counter: reconnect requested");
+                    client.abort().await;
+                    break 'connected;
+                }
+            }
+        }
+
+        if errored {
+            Timer::after(EmbassyDuration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs.saturating_mul(2)).min(30);
+        } else {
+            // Manual reconnect request: keep it quick.
+            Timer::after(EmbassyDuration::from_secs(1)).await;
+            backoff_secs = 2;
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn discovery_task(stack: Stack<'static>) {
+    #[derive(Debug, Deserialize)]
+    struct DiscoveryMsg {
+        #[serde(default)]
+        service: Option<alloc::string::String>,
+
+        #[serde(default)]
+        reconnect: Option<bool>,
+
+        #[serde(default)]
+        ip: Option<alloc::string::String>,
+
+        #[serde(default)]
+        mqtt_port: Option<u16>,
+    }
+
+    loop {
+        stack.wait_link_up().await;
+        stack.wait_config_up().await;
+
+        let mut rx_meta = [embassy_net::udp::PacketMetadata::EMPTY; 4];
+        let mut tx_meta = [embassy_net::udp::PacketMetadata::EMPTY; 4];
+        let mut rx_buf = [0u8; 512];
+        let mut tx_buf = [0u8; 256];
+        let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
+
+        // Listen on a fixed UDP port so peers can broadcast to it.
+        const DISCOVERY_PORT: u16 = 53530;
+        if let Err(e) = socket.bind(DISCOVERY_PORT) {
+            log::warn!("discovery: bind failed: {:?}", e);
+            Timer::after(EmbassyDuration::from_secs(2)).await;
+            continue;
+        }
+
+        // Broadcast announce. (255.255.255.255)
+        let broadcast = stack
+            .config_v4()
+            .and_then(|cfg| cfg.address.broadcast())
+            .unwrap_or(embassy_net::Ipv4Address::new(255, 255, 255, 255));
+        log::info!("discovery: broadcasting to {}:{}", broadcast, DISCOVERY_PORT);
+        let announce = b"{\"service\":\"esp32tft\",\"http_port\":8080}";
+
+        // Discovery doesn't need to be ultra-frequent; slower reduces serial/log spam
+        // and avoids wasting airtime on crowded 2.4GHz.
+        let mut ticker = Ticker::every(EmbassyDuration::from_secs(5));
+        let mut buf = [0u8; 512];
+        let mut last_broker: Option<(embassy_net::Ipv4Address, u16)> = None;
+
+        loop {
+            ticker.next().await;
+
+            // announce ourselves
+            let _ = socket.send_to(announce, (broadcast, DISCOVERY_PORT)).await;
+
+            // opportunistically receive any peer announcements
+            if let Either::First(Ok((n, from))) = select(
+                socket.recv_from(&mut buf),
+                Timer::after(EmbassyDuration::from_millis(250)),
+            )
+            .await
+                && let Ok(msg) = serde_json::from_slice::<DiscoveryMsg>(&buf[..n])
+                && msg.service.as_deref() == Some("web_gui")
+            {
+                let embassy_net::IpAddress::Ipv4(ip) = from.endpoint.addr;
+
+                // Prefer explicit broker IP from payload (more robust with multiple NICs/VPNs).
+                let broker_ip = msg.ip.as_deref().and_then(|s| {
+                    let v = s.parse::<core::net::Ipv4Addr>().ok()?;
+                    let [a, b, c, d] = v.octets();
+                    Some(embassy_net::Ipv4Address::new(a, b, c, d))
+                });
+
+                let broker_ip = broker_ip.unwrap_or(ip);
+
+                let broker_port = msg.mqtt_port.unwrap_or(1883);
+
+                let broker = (broker_ip, broker_port);
+                if last_broker != Some(broker) {
+                    last_broker = Some(broker);
+                    log::info!(
+                        "discovery: web_gui announce from {} (broker {}:{})",
+                        ip,
+                        broker_ip,
+                        broker_port
+                    );
+                    WEB_GUI_IPV4.dyn_sender().send(Some(broker_ip));
+                    WEB_GUI_MQTT_PORT.dyn_sender().send(Some(broker_port));
+                }
+
+                if msg.reconnect.unwrap_or(false) {
+                    MQTT_RECONNECT.signal(());
+                }
+            }
+        }
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn parse_content_length(headers: &str) -> usize {
+    for line in headers.lines() {
+        if let Some(rest) = line.strip_prefix("Content-Length:")
+            && let Ok(v) = rest.trim().parse::<usize>()
+        {
+            return v;
+        }
+        if let Some(rest) = line.strip_prefix("content-length:")
+            && let Ok(v) = rest.trim().parse::<usize>()
+        {
+            return v;
+        }
+    }
+    0
+}
+
+#[derive(Debug, Deserialize)]
+struct EspCounterBody {
+    #[serde(default)]
+    counter: Option<i32>,
+    #[serde(default)]
+    count: Option<i32>,
+}
+
+#[embassy_executor::task]
+async fn esp_counter_server_task(stack: Stack<'static>) {
+    let mut logged_config = false;
+
+    loop {
+        stack.wait_link_up().await;
+        stack.wait_config_up().await;
+        if !logged_config {
+            logged_config = true;
+            log::info!("esp_counter_server: IPv4 config up: {:?}", stack.config_v4());
+            log::info!("esp_counter_server: listening on :8080/esp_counter");
+        }
+
+        // Serve sequentially (single socket) to keep resource usage low.
+        let mut rx_buffer = [0; 2048];
         let mut tx_buffer = [0; 1024];
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(EmbassyDuration::from_secs(10)));
-        let addr = embassy_net::Ipv4Address::new(192, 168, 0, 173);
-        if let Err(e) = socket.connect((addr, 8080)).await {
-            log::warn!("connect failed: {:?}", e);
+        socket.set_timeout(Some(EmbassyDuration::from_secs(15)));
+
+        if let Err(e) = socket.accept(8080).await {
+            log::warn!("esp_counter_server: accept failed: {:?}", e);
+            Timer::after(EmbassyDuration::from_millis(250)).await;
             continue;
         }
-        let body = alloc::format!("{{\"count\": {}}}", value);
-        let request = alloc::format!("POST /counter HTTP/1.1\r\nHost: 192.168.0.173\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
-        if let Err(e) = socket.write_all(request.as_bytes()).await {
-            log::warn!("write failed: {:?}", e);
-            continue;
+
+        // Fallback discovery: learn the desktop IP from the TCP connection source.
+        if let Some(remote) = socket.remote_endpoint() {
+            let embassy_net::IpAddress::Ipv4(ip) = remote.addr;
+            WEB_GUI_IPV4.dyn_sender().send(Some(ip));
+            log::info!("esp_counter_server: learned web_gui IP from request: {}", ip);
         }
-        let mut buf = [0; 1024];
-        let _ = socket.read(&mut buf).await;
+
+        let mut req = alloc::vec::Vec::<u8>::new();
+        let mut tmp = [0u8; 512];
+        let mut header_end: Option<usize> = None;
+        let mut body_len: Option<usize> = None;
+        let max_req = 4096usize;
+
+        loop {
+            match socket.read(&mut tmp).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if req.len() + n > max_req {
+                        break;
+                    }
+                    req.extend_from_slice(&tmp[..n]);
+
+                    if header_end.is_none() && let Some(idx) = find_subslice(&req, b"\r\n\r\n") {
+                        header_end = Some(idx);
+                        body_len = Some(
+                            core::str::from_utf8(&req[..idx])
+                                .map(parse_content_length)
+                                .unwrap_or(0),
+                        );
+                    }
+
+                    if let (Some(h_end), Some(b_len)) = (header_end, body_len) {
+                        let needed = h_end + 4 + b_len;
+                        if req.len() >= needed {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        let mut status = "400 Bad Request";
+        let mut response_body = "{\"error\":\"bad_request\"}";
+
+        if let Some(h_end) = header_end
+            && let Ok(headers_str) = core::str::from_utf8(&req[..h_end])
+        {
+            let mut lines = headers_str.lines();
+            if let Some(start_line) = lines.next() {
+                let mut parts = start_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let path = parts.next().unwrap_or("");
+
+                    let b_len = body_len.unwrap_or(0);
+                    let body_start = h_end + 4;
+                    let body_end = core::cmp::min(req.len(), body_start + b_len);
+                    let body_bytes = if body_start <= req.len() { &req[body_start..body_end] } else { &[] };
+
+                if method == "POST" && path == "/esp_counter" {
+                        match serde_json::from_slice::<EspCounterBody>(body_bytes) {
+                            Ok(body) => {
+                                if let Some(v) = body.counter.or(body.count) {
+                                    let clamped = v.clamp(0, 100);
+                                    COUNTER_OVERRIDE.signal(clamped);
+                                    status = "200 OK";
+                                    response_body = "{\"status\":\"ok\"}";
+                                } else {
+                                    status = "400 Bad Request";
+                                    response_body = "{\"error\":\"missing_counter\"}";
+                                }
+                            }
+                            Err(_) => {
+                                status = "400 Bad Request";
+                                response_body = "{\"error\":\"invalid_json\"}";
+                            }
+                        }
+                } else {
+                    status = "404 Not Found";
+                    response_body = "{\"error\":\"not_found\"}";
+                }
+            }
+        }
+
+        let resp = alloc::format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+            response_body.len()
+        );
+        let _ = socket.write_all(resp.as_bytes()).await;
         socket.close();
     }
 }
@@ -455,6 +998,8 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     ui.set_wifi_state(WifiConnState::Disconnected as i32);
     ui.set_wifi_attempt(0);
     ui.set_wifi_blink(false);
+    ui.set_wifi_ip("".into());
+    ui.set_wifi_mac("".into());
     ui.show().unwrap();
 
     // Force at least one frame to render.
@@ -464,6 +1009,8 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     let mut counter_rx = COUNTER_VALUE.dyn_receiver().unwrap();
     let mut heartbeat_rx = HEARTBEAT_VALUE.dyn_receiver().unwrap();
     let mut wifi_rx = WIFI_UI.dyn_receiver().unwrap();
+    let mut esp_ipv4_rx = ESP_IPV4.dyn_receiver().unwrap();
+    let mut esp_mac_rx = ESP_MAC.dyn_receiver().unwrap();
     let frame_enable_tx = FRAME_ENABLE.dyn_sender();
     let frame_enable_rx = FRAME_ENABLE.dyn_receiver().unwrap();
 
@@ -494,9 +1041,25 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
                     );
 
                     _spawner.must_spawn(net_task(runner));
-                    // Spawn post task
-                    let counter_rx_post = COUNTER_VALUE.dyn_receiver().unwrap();
-                    _spawner.must_spawn(post_task(stack, counter_rx_post));
+                    _spawner.must_spawn(netinfo_task(
+                        stack,
+                        ESP_IPV4.dyn_sender(),
+                        ESP_MAC.dyn_sender(),
+                    ));
+                    // Keep a single long-lived MQTT connection to the embedded desktop broker.
+                    let counter_rx_mqtt = COUNTER_VALUE.dyn_receiver().unwrap();
+                    let web_gui_rx_mqtt = WEB_GUI_IPV4.dyn_receiver().unwrap();
+                    let web_gui_port_rx_mqtt = WEB_GUI_MQTT_PORT.dyn_receiver().unwrap();
+                    _spawner.must_spawn(mqtt_counter_task(
+                        stack,
+                        counter_rx_mqtt,
+                        web_gui_rx_mqtt,
+                        web_gui_port_rx_mqtt,
+                    ));
+                    // Spawn server task to accept counter pushes from web_gui.
+                    _spawner.must_spawn(esp_counter_server_task(stack));
+                    // UDP discovery/announce to learn web_gui IP automatically.
+                    _spawner.must_spawn(discovery_task(stack));
                 }
                 Err(e) => {
                     log::warn!("wifi: init controller failed: {e:?}");
@@ -517,7 +1080,16 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         slint::platform::update_timers_and_animations();
 
         // Coalesce any pending updates before rendering.
-        drain_ui_events(&rx_hi, &mut counter_rx, &mut heartbeat_rx, &mut wifi_rx, &ui, &window);
+        drain_ui_events(
+            &rx_hi,
+            &mut counter_rx,
+            &mut heartbeat_rx,
+            &mut wifi_rx,
+            &mut esp_ipv4_rx,
+            &mut esp_mac_rx,
+            &ui,
+            &window,
+        );
 
         // 2) Render if needed.
         window.draw_if_needed(|renderer| {
@@ -525,7 +1097,16 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         });
 
         // Coalesce any pending updates that happened during render.
-        drain_ui_events(&rx_hi, &mut counter_rx, &mut heartbeat_rx, &mut wifi_rx, &ui, &window);
+        drain_ui_events(
+            &rx_hi,
+            &mut counter_rx,
+            &mut heartbeat_rx,
+            &mut wifi_rx,
+            &mut esp_ipv4_rx,
+            &mut esp_mac_rx,
+            &ui,
+            &window,
+        );
 
         // If Slint has active animations, keep driving frames while still reacting to input.
         let anim_enabled = window.window().has_active_animations();
@@ -575,7 +1156,16 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
                     window.request_redraw();
                 }
             }
-            drain_ui_events(&rx_hi, &mut counter_rx, &mut heartbeat_rx, &mut wifi_rx, &ui, &window);
+            drain_ui_events(
+                &rx_hi,
+                &mut counter_rx,
+                &mut heartbeat_rx,
+                &mut wifi_rx,
+                &mut esp_ipv4_rx,
+                &mut esp_mac_rx,
+                &ui,
+                &window,
+            );
             continue;
         }
 
@@ -654,6 +1244,15 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         }
 
         // Also apply any queued events that may have raced with the wait.
-        drain_ui_events(&rx_hi, &mut counter_rx, &mut heartbeat_rx, &mut wifi_rx, &ui, &window);
+        drain_ui_events(
+            &rx_hi,
+            &mut counter_rx,
+            &mut heartbeat_rx,
+            &mut wifi_rx,
+            &mut esp_ipv4_rx,
+            &mut esp_mac_rx,
+            &ui,
+            &window,
+        );
     }
 }

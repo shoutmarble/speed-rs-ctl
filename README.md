@@ -10,14 +10,19 @@ ESP32-S3 firmware project using Embassy + Rust.
 ```powershell
 cargo esp-build-all-release
 ```
+```powershell
+espflash flash --port COM3 -M target\xtensa-esp32s3-none-elf\release\slint_tft
+```
 
+```
+cargo run --release --bin web_gui --features web_gui
+```
 ```
 cargo run --bin web_gui --features web_gui
 ```
 
-```powershell
-espflash flash --port COM3 -M target\xtensa-esp32s3-none-elf\release\slint_tft
-```
+
+
 
 
 ## Prerequisites
@@ -80,8 +85,23 @@ cargo esp-build-slint-tft-release
 ```
 
 ## RUN DESKTOP GUI
-```
+```powershell
+# The desktop GUI hosts an embedded MQTT broker on TCP :1883 (standard MQTT port)
+# and uses UDP broadcast discovery on :53530
+# to find the ESP automatically (no hardcoded IP).
 cargo run --bin web_gui --features web_gui
+
+# If your router/VLAN blocks 255.255.255.255 broadcasts, set the subnet broadcast explicitly:
+# $env:SPEED_DISCOVERY_BROADCAST = "192.168.0.255"
+
+# Optional override (skip discovery):
+# $env:SPEED_ESP_HOST = "192.168.0.50"
+
+# If UDP discovery is blocked (VLANs, Wi-Fi isolation, Windows firewall), set SPEED_ESP_HOST
+# so web_gui will also send discovery announces directly (unicast) to that IP.
+
+# Note: setting SPEED_ESP_HOST enables unicast discovery announces
+# (helpful when broadcasts are blocked across VLANs/subnets).
 ```
 
 ## Flash

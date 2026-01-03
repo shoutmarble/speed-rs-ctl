@@ -50,6 +50,7 @@ esp = [
   "dep:embedded-hal",
   "dep:embedded-io",
   "dep:embedded-io-async",
+  "dep:embedded-io-async07",
   "dep:esp-alloc",
   "dep:esp-println",
   "dep:esp-backtrace",
@@ -66,18 +67,24 @@ esp = [
   "dep:mipidsi",
   "dep:serde",
   "dep:serde_json",
+  "dep:rust-mqtt",
 ]
 
 web_gui = [
   "dep:iced",
-  "dep:warp",
   "dep:tokio",
+  "dep:futures-util",
   "dep:serde",
   "dep:serde_json",
+  "dep:rumqttd",
+  "dep:mac_address",
+  "dep:tracing-subscriber",
 ]
 
 [dependencies]
 log = "0.4.29"
+
+futures-util = { version = "0.3.31", optional = true }
 
 embedded-hal = { version = "1.0.0", optional = true }
 
@@ -104,6 +111,7 @@ embassy-net = { version = "0.7.1", optional = true, features = [
 ] }
 embedded-io = { version = "0.7.1", optional = true }
 embedded-io-async = { version = "0.6.1", optional = true }
+embedded-io-async07 = { package = "embedded-io-async", version = "0.7.0", optional = true }
 esp-alloc = { version = "0.9.0", optional = true }
 esp-println = { version = "0.16.1", optional = true, features = ["esp32s3", "log-04"] }
 esp-backtrace = { version = "0.18.1", optional = true, features = ["esp32s3", "panic-handler", "println"] }
@@ -150,8 +158,19 @@ serde = { version = "1.0.228", default-features = false, features = ["derive", "
 serde_json = { version = "1.0.148", default-features = false, features = ["alloc"], optional = true }
 
 iced = { version = "0.14.0", optional = true, features = ["tokio"] }
-warp = { version = "0.4.2", optional = true, features = ["server"] }
 tokio = { version = "1.48.0", features = ["full"], optional = true }
+
+# Desktop embedded MQTT broker
+rumqttd = { version = "0.20.0", optional = true }
+
+# Enable logs from rumqttd (it uses `tracing`)
+tracing-subscriber = { version = "0.3.20", optional = true, features = ["env-filter"] }
+
+# Query local network interface MAC addresses (desktop)
+mac_address = { version = "1.1.8", optional = true }
+
+# no_std MQTT client (ESP)
+rust-mqtt = { version = "0.4.0", default-features = false, features = ["v5", "alloc"], optional = true }
 
 
 [build-dependencies]

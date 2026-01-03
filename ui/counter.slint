@@ -5,6 +5,8 @@ export component CounterWindow inherits Window {
     in-out property <int> wifi_attempt: 0;
     in-out property <bool> wifi_blink: false;
     in-out property <string> wifi_ssid: "";
+    in-out property <string> wifi_ip: "";
+    in-out property <string> wifi_mac: "";
 
     width: 240px;
     height: 135px;
@@ -13,45 +15,66 @@ export component CounterWindow inherits Window {
         alignment: center;
         spacing: 6px;
 
-        HorizontalLayout {
+        VerticalLayout {
             alignment: center;
-            spacing: 6px;
+            spacing: 2px;
 
-            Rectangle {
-                width: 12px;
-                height: 12px;
-                border-radius: 6px;
-                background: {
-                    if wifi_state == 2 {
-                        green
-                    } else if wifi_state == 1 && wifi_blink {
-                        orange
-                    } else {
-                        red
-                    }
-                };
+            HorizontalLayout {
+                alignment: center;
+                spacing: 6px;
+
+                Rectangle {
+                    width: 12px;
+                    height: 12px;
+                    border-radius: 6px;
+                    background: {
+                        if wifi_state == 2 {
+                            green
+                        } else if wifi_state == 1 && wifi_blink {
+                            orange
+                        } else {
+                            red
+                        }
+                    };
+                }
+
+                Text {
+                    font-size: 14px;
+                    text: {
+                        if wifi_state == 2 {
+                            "SSID: " + wifi_ssid
+                        } else if wifi_state == 1 {
+                            "WiFi: connecting (" + wifi_attempt + "/3)"
+                        } else {
+                            "WiFi: disconnected"
+                        }
+                    };
+                    color: {
+                        if wifi_state == 2 {
+                            green
+                        } else if wifi_state == 1 && wifi_blink {
+                            orange
+                        } else {
+                            red
+                        }
+                    };
+                }
             }
 
             Text {
-                font-size: 14px;
-                text: {
-                    if wifi_state == 2 {
-                        "WiFi: " + wifi_ssid
-                    } else if wifi_state == 1 {
-                        "WiFi: connecting (" + wifi_attempt + "/3)"
-                    } else {
-                        "WiFi: disconnected"
-                    }
-                };
-                color: {
-                    if wifi_state == 2 {
-                        green
-                    } else if wifi_state == 1 && wifi_blink {
-                        orange
-                    } else {
-                        red
-                    }
-                };
+                visible: wifi_state == 2 && wifi_ip != "";
+                font-size: 12px;
+                horizontal-alignment: center;
+                text: "IP: " + wifi_ip;
+                color: green;
+            }
+
+            Text {
+                visible: wifi_state == 2 && wifi_mac != "";
+                font-size: 12px;
+                horizontal-alignment: center;
+                text: "MAC: " + wifi_mac;
+                color: green;
             }
         }
 
